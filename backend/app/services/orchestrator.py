@@ -22,6 +22,7 @@ from app.services.scorer_service import ScorerService
 from app.services.response_generator import ResponseGenerator
 from app.services.tool_executor import ToolExecutor
 from app.services.session_manager import SessionManager
+from app.services.conversation_memory import conversation_memory
 
 logger = logging.getLogger(__name__)
 
@@ -54,25 +55,40 @@ class ConversationOrchestrator:
         log_id = str(uuid.uuid4())
 
         try:
+            # Step 0: 获取对话历史上下文
+            conversation_history = await conversation_memory.get_formatted_history(
+                session.session_id, max_turns=5
+            )
+
+            # 记录用户消息到记忆
+            await conversation_memory.add_message(
+                session.session_id, "user", user_message
+            )
+
             # Step 1: 意图识别 & 实体抽取 & 情绪识别
-            nlu_result = await self.nlu.analyze(user_message, session)
+            nlu_result = await self.nlu.analyze(
+                user_message, session, conversation_history
+            )
             intent = nlu_result["intent"]
             emotion = nlu_result["emotion"]
             entities = nlu_result["entities"]
             confidence = nlu_result["confidence"]
 
-            logger.info(f"NLU结果: intent={intent}, emotion={emotion}, confidence={confidence}")
+            logger.info(f"NLU结果: intent={intent}, emotion={emotion}, confidence={confidence}, source={nlu_result.get('source')}")
 
             # 更新会话状态
             await self.session_manager.update_session(session, {
                 "current_intent": intent,
                 "emotion": emotion,
-                "slots": {**( session.slots or {}), **entities},
+                "slots": {**(session.slots or {}), **entities},
             })
 
             # Step 2: 低置信度处理 - 触发澄清问题
             if confidence < 0.6:
                 clarification = await self.nlu.generate_clarification(user_message, intent)
+                await conversation_memory.add_message(
+                    session.session_id, "assistant", clarification
+                )
                 return ChatResponse(
                     session_id=session.session_id,
                     message=clarification,
@@ -122,11 +138,15 @@ class ConversationOrchestrator:
 
             # Step 8: 检查是否需要强制转人工
             if filtered_result.get("force_handoff"):
-                return await self._handle_handoff(
+                response = await self._handle_handoff(
                     session=session,
                     reason=filtered_result.get("handoff_reason", "规则触发转人工"),
                     context=context,
                 )
+                await conversation_memory.add_message(
+                    session.session_id, "assistant", response.message
+                )
+                return response
 
             # Step 9: 多维打分排序
             scored_actions = await self.scorer.score(
@@ -155,7 +175,14 @@ class ConversationOrchestrator:
                 knowledge=knowledge_results,
                 context=context,
                 tool_results=tool_results,
-                scored_actions=scored_actions[:3],  # 提供前3个候选供生成按钮
+                scored_actions=scored_actions[:3],
+                user_message=user_message,
+                conversation_history=conversation_history,
+            )
+
+            # 记录回复到记忆
+            await conversation_memory.add_message(
+                session.session_id, "assistant", response.message
             )
 
             # Step 13: 记录对话日志
@@ -220,6 +247,11 @@ class ConversationOrchestrator:
             action_id=action_id,
             tool_results=tool_results,
             session=session,
+        )
+
+        # 记录到对话记忆
+        await conversation_memory.add_message(
+            session_id, "assistant", response.message
         )
 
         return response

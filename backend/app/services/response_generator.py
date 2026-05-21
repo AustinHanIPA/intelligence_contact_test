@@ -1,12 +1,15 @@
 """
 回复生成服务
 根据选择的动作、知识证据和工具结果，生成自然客服回复
+支持 LLM 生成（优先） + 模板兜底
 """
+import json
 import logging
 from typing import List, Dict, Any, Optional
 
 from app.models.session import CustomerSession
 from app.schemas.chat import ChatResponse, ActionButton, MessageType
+from app.services.llm_service import llm_service
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +43,12 @@ class ResponseGenerator:
         context: Dict[str, Any],
         tool_results: Optional[Dict[str, Any]],
         scored_actions: List[Dict[str, Any]] = None,
+        user_message: str = "",
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> ChatResponse:
         """
         生成最终客服回复
+        策略：优先LLM生成，失败时回退到模板
         """
         session_id = context.get("session_info", {}).get("session_id", "")
 
@@ -54,6 +60,34 @@ class ResponseGenerator:
         if action_type == "human_transfer":
             return self._generate_handoff_response(session_id, emotion)
 
+        # 尝试LLM生成
+        if llm_service.enabled and user_message:
+            llm_response = await self._generate_with_llm(
+                user_message=user_message,
+                intent=intent,
+                emotion=emotion,
+                selected_action=selected_action,
+                knowledge=knowledge,
+                tool_results=tool_results,
+                conversation_history=conversation_history,
+            )
+            if llm_response:
+                buttons = self._generate_buttons(scored_actions)
+                if action_type == "tool_call" and tool_results:
+                    buttons = self._generate_follow_up_buttons(
+                        selected_action.get("tool_name", ""), 
+                        tool_results.get("data", {}),
+                        scored_actions,
+                    )
+                return ChatResponse(
+                    session_id=session_id,
+                    message=llm_response,
+                    message_type=MessageType.TEXT,
+                    buttons=buttons if buttons else None,
+                    metadata={"tool_result": tool_results.get("data") if tool_results else None},
+                )
+
+        # 回退到模板生成
         if action_type == "faq_answer":
             return self._generate_faq_response(
                 session_id, selected_action, emotion, scored_actions
@@ -65,6 +99,37 @@ class ResponseGenerator:
             )
 
         return self._generate_fallback_response(session_id, emotion)
+
+    async def _generate_with_llm(
+        self,
+        user_message: str,
+        intent: str,
+        emotion: str,
+        selected_action: Dict[str, Any],
+        knowledge: List[Dict[str, Any]],
+        tool_results: Optional[Dict[str, Any]],
+        conversation_history: Optional[List[Dict[str, str]]],
+    ) -> Optional[str]:
+        """使用LLM生成回复"""
+        knowledge_text = ""
+        if knowledge:
+            knowledge_text = "\n".join(
+                f"- {k.get('title', '')}: {k.get('content', '')}" 
+                for k in knowledge[:3]
+            )
+
+        tool_text = ""
+        if tool_results and tool_results.get("success"):
+            tool_text = json.dumps(tool_results.get("data", {}), ensure_ascii=False, indent=2)
+
+        return await llm_service.generate_response(
+            user_message=user_message,
+            intent=intent,
+            emotion=emotion,
+            knowledge_context=knowledge_text,
+            tool_results=tool_text,
+            conversation_history=conversation_history,
+        )
 
     async def generate_from_tool_result(
         self,
@@ -106,8 +171,6 @@ class ResponseGenerator:
         content = action.get("knowledge_content", action.get("user_message_template", ""))
 
         message = f"{tone_prefix}{content}"
-
-        # 生成操作按钮
         buttons = self._generate_buttons(scored_actions)
 
         return ChatResponse(
@@ -130,7 +193,6 @@ class ResponseGenerator:
         tone_prefix = TONE_TEMPLATES.get(EMOTION_TONE_MAP.get(emotion, "professional"), "")
 
         if not tool_results or not tool_results.get("success"):
-            # 工具调用失败
             message = f"{tone_prefix}抱歉，系统暂时无法获取相关信息。请稍后再试，或者我可以帮您转接人工客服。"
             return ChatResponse(
                 session_id=session_id,
@@ -142,13 +204,9 @@ class ResponseGenerator:
                 ],
             )
 
-        # 根据不同工具生成自然语言回复
         data = tool_results.get("data", {})
         tool_name = action.get("tool_name", "")
-
         message = self._format_tool_result(tool_name, data, tone_prefix, context)
-
-        # 生成后续操作按钮
         buttons = self._generate_follow_up_buttons(tool_name, data, scored_actions)
 
         return ChatResponse(
@@ -265,7 +323,7 @@ class ResponseGenerator:
         if not scored_actions:
             return buttons
 
-        for action in scored_actions[1:4]:  # 排除已选动作，取接下来的2-3个
+        for action in scored_actions[1:4]:
             if action.get("action_type") == "human_transfer":
                 buttons.append(
                     ActionButton(label="转人工客服", action="handoff", params={})

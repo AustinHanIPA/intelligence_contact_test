@@ -27,8 +27,17 @@ api.interceptors.request.use(
 api.interceptors.response.use(
   (response) => response.data,
   (error) => {
+    // 401 未认证：清除token并跳转登录
+    if (error.response?.status === 401) {
+      localStorage.removeItem('token')
+      localStorage.removeItem('user')
+      if (window.location.pathname !== '/login') {
+        window.location.href = '/login'
+      }
+    }
     console.error('API Error:', error.response?.data || error.message)
-    return Promise.reject(error)
+    const message = error.response?.data?.detail || error.message || '请求失败'
+    return Promise.reject(new Error(message))
   }
 )
 
@@ -84,6 +93,23 @@ export const sessionApi = {
 
   close: (sessionId: string) =>
     api.post(`/sessions/${sessionId}/close`),
+}
+
+// 认证相关API
+export const authApi = {
+  login: (username: string, password: string) => {
+    const formData = new URLSearchParams()
+    formData.append('username', username)
+    formData.append('password', password)
+    return api.post('/auth/login', formData, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    })
+  },
+
+  register: (username: string, password: string, email?: string) =>
+    api.post('/auth/register', { username, password, email }),
+
+  me: () => api.get('/auth/me'),
 }
 
 // 管理后台API

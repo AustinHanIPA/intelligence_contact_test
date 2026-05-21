@@ -8,12 +8,13 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_, and_
+from sqlalchemy import select, func, or_, and_, text
 
 from app.models.knowledge import KnowledgeChunk
 from app.schemas.knowledge import (
     KnowledgeCreate, KnowledgeUpdate, KnowledgeResponse, KnowledgeListResponse
 )
+from app.services.embedding_service import embedding_service
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,7 @@ class KnowledgeService:
     ) -> List[Dict[str, Any]]:
         """
         混合检索知识
-        策略：FAQ精确匹配 + 关键词检索 + 向量检索
+        策略：FAQ精确匹配 + 向量检索 + 关键词检索
         """
         results = []
 
@@ -100,11 +101,15 @@ class KnowledgeService:
         faq_results = self._search_builtin_faq(query, intent)
         results.extend(faq_results)
 
-        # 2. 数据库关键词检索
+        # 2. 向量语义检索
+        vector_results = await self._vector_search(query, intent, top_k)
+        results.extend(vector_results)
+
+        # 3. 数据库关键词检索
         db_results = await self._keyword_search(query, intent, top_k)
         results.extend(db_results)
 
-        # 3. 合并去重并排序
+        # 4. 合并去重并排序
         seen_ids = set()
         unique_results = []
         for item in results:
@@ -113,7 +118,10 @@ class KnowledgeService:
                 seen_ids.add(kid)
                 unique_results.append(item)
 
-        # 4. 过滤过期知识
+        # 5. 按分数降序排序
+        unique_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+        # 6. 过滤过期知识
         unique_results = self._filter_expired(unique_results)
 
         return unique_results[:top_k]
@@ -140,6 +148,56 @@ class KnowledgeService:
                 })
         results.sort(key=lambda x: x["score"], reverse=True)
         return results
+
+    async def _vector_search(
+        self, query: str, intent: Optional[str], top_k: int
+    ) -> List[Dict[str, Any]]:
+        """向量语义检索"""
+        try:
+            # 生成查询向量
+            query_embedding = await embedding_service.embed_text(query)
+            if not query_embedding:
+                return []
+
+            # 使用pgvector余弦相似度查询
+            embedding_str = f"[{','.join(str(x) for x in query_embedding)}]"
+            
+            stmt = text("""
+                SELECT knowledge_id, title, content, type, domain, intent, 
+                       risk_level, forbidden_claims,
+                       1 - (embedding <=> :embedding::vector) AS similarity
+                FROM knowledge_chunks 
+                WHERE status = 'active' 
+                AND embedding IS NOT NULL
+                ORDER BY embedding <=> :embedding::vector
+                LIMIT :limit
+            """)
+
+            result = await self.db.execute(
+                stmt, {"embedding": embedding_str, "limit": top_k}
+            )
+            rows = result.fetchall()
+
+            return [
+                {
+                    "knowledge_id": row[0],
+                    "title": row[1],
+                    "content": row[2],
+                    "type": row[3],
+                    "domain": row[4],
+                    "intent": row[5],
+                    "risk_level": row[6],
+                    "forbidden_claims": row[7],
+                    "score": float(row[8]) if row[8] else 0.0,
+                    "source": "vector",
+                }
+                for row in rows
+                if row[8] and float(row[8]) > 0.3  # 相似度阈值
+            ]
+
+        except Exception as e:
+            logger.warning(f"向量检索失败（可能尚未初始化embedding）: {str(e)}")
+            return []
 
     async def _keyword_search(
         self, query: str, intent: Optional[str], top_k: int
@@ -251,7 +309,10 @@ class KnowledgeService:
         return result.scalar_one_or_none()
 
     async def create_knowledge(self, data: KnowledgeCreate) -> KnowledgeChunk:
-        """创建知识条目"""
+        """创建知识条目（自动生成embedding）"""
+        # 生成embedding
+        embedding = await embedding_service.embed_text(f"{data.title} {data.content}")
+
         chunk = KnowledgeChunk(
             knowledge_id=data.knowledge_id,
             chunk_id=str(uuid.uuid4())[:8],
@@ -271,6 +332,7 @@ class KnowledgeService:
             need_human_review=data.need_human_review,
             source_doc=data.source_doc,
             forbidden_claims=data.forbidden_claims,
+            embedding=embedding,
             status="draft",
         )
         self.db.add(chunk)
@@ -290,6 +352,14 @@ class KnowledgeService:
         for key, value in update_data.items():
             setattr(chunk, key, value)
         chunk.updated_at = datetime.utcnow()
+
+        # 如果内容或标题变化，重新生成embedding
+        if "title" in update_data or "content" in update_data:
+            new_embedding = await embedding_service.embed_text(
+                f"{chunk.title} {chunk.content}"
+            )
+            if new_embedding:
+                chunk.embedding = new_embedding
 
         await self.db.flush()
         await self.db.refresh(chunk)
@@ -311,6 +381,47 @@ class KnowledgeService:
             chunk.updated_at = datetime.utcnow()
             await self.db.flush()
 
+    async def batch_import(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """批量导入知识"""
+        success_count = 0
+        error_count = 0
+        errors = []
+
+        for idx, item in enumerate(items):
+            try:
+                embedding = await embedding_service.embed_text(
+                    f"{item.get('title', '')} {item.get('content', '')}"
+                )
+                chunk = KnowledgeChunk(
+                    knowledge_id=item.get("knowledge_id", f"import_{uuid.uuid4().hex[:8]}"),
+                    chunk_id=str(uuid.uuid4())[:8],
+                    title=item["title"],
+                    content=item["content"],
+                    type=item.get("type", "faq"),
+                    domain=item.get("domain", "general"),
+                    intent=item.get("intent"),
+                    risk_level=item.get("risk_level", "low"),
+                    owner=item.get("owner"),
+                    forbidden_claims=item.get("forbidden_claims"),
+                    embedding=embedding,
+                    status="draft",
+                )
+                self.db.add(chunk)
+                success_count += 1
+            except Exception as e:
+                error_count += 1
+                errors.append({"row": idx + 1, "error": str(e)})
+
+        if success_count > 0:
+            await self.db.flush()
+
+        return {
+            "total": len(items),
+            "success": success_count,
+            "failed": error_count,
+            "errors": errors[:10],  # 最多返回10条错误信息
+        }
+
     async def get_stats(self) -> Dict[str, Any]:
         """获取知识库统计"""
         total = await self.db.execute(select(func.count(KnowledgeChunk.id)))
@@ -320,10 +431,14 @@ class KnowledgeService:
         draft = await self.db.execute(
             select(func.count(KnowledgeChunk.id)).where(KnowledgeChunk.status == "draft")
         )
+        with_embedding = await self.db.execute(
+            select(func.count(KnowledgeChunk.id)).where(KnowledgeChunk.embedding.isnot(None))
+        )
 
         return {
             "total": total.scalar() or 0,
             "active": active.scalar() or 0,
             "draft": draft.scalar() or 0,
+            "with_embedding": with_embedding.scalar() or 0,
             "builtin_faq_count": len(BUILTIN_FAQ),
         }

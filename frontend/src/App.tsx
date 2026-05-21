@@ -1,17 +1,50 @@
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom'
+import { useEffect } from 'react'
 import ChatPage from './pages/ChatPage'
 import AdminPage from './pages/AdminPage'
+import LoginPage from './pages/LoginPage'
 import Layout from './components/Layout'
+import { useAuthStore } from './store/authStore'
+
+/**
+ * 受保护路由 - 需要登录才能访问
+ */
+function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  const { isAuthenticated } = useAuthStore()
+
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />
+  }
+
+  return <>{children}</>
+}
 
 function App() {
+  const { loadFromStorage } = useAuthStore()
+
+  useEffect(() => {
+    loadFromStorage()
+  }, [])
+
   return (
     <Router>
       <Routes>
-        {/* 用户端 - 聊天界面 */}
-        <Route path="/chat" element={<ChatPage />} />
+        {/* 登录/注册 */}
+        <Route path="/login" element={<LoginPage />} />
 
-        {/* 管理后台 */}
-        <Route path="/admin" element={<Layout />}>
+        {/* 用户端 - 聊天界面（需要登录） */}
+        <Route path="/chat" element={
+          <ProtectedRoute>
+            <ChatPage />
+          </ProtectedRoute>
+        } />
+
+        {/* 管理后台（需要登录） */}
+        <Route path="/admin" element={
+          <ProtectedRoute>
+            <Layout />
+          </ProtectedRoute>
+        }>
           <Route index element={<AdminPage />} />
           <Route path="knowledge" element={<AdminPage />} />
           <Route path="sessions" element={<AdminPage />} />

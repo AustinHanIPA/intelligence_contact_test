@@ -3,6 +3,7 @@
  */
 import { create } from 'zustand'
 import { chatApi } from '../services/api'
+import { useAuthStore } from './authStore'
 
 export interface Message {
   id: string
@@ -38,6 +39,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   sendMessage: async (content: string) => {
     const { sessionId, userId } = get()
+    // 优先使用认证用户ID
+    const authUser = useAuthStore.getState().user
+    const effectiveUserId = authUser?.user_id || userId
 
     // 添加用户消息
     const userMessage: Message = {
@@ -51,7 +55,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       const response: any = await chatApi.sendMessage({
         session_id: sessionId || undefined,
-        user_id: userId,
+        user_id: effectiveUserId,
         message: content,
       })
 

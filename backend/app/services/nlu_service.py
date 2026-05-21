@@ -1,11 +1,13 @@
 """
 NLU服务 - 意图识别、情绪识别、实体抽取
+支持规则匹配（基线）+ LLM增强（可选）
 """
 import re
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from app.models.session import CustomerSession
+from app.services.llm_service import llm_service
 
 logger = logging.getLogger(__name__)
 
@@ -42,28 +44,42 @@ class NLUService:
         self,
         message: str,
         session: Optional[CustomerSession] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         """
         分析用户消息
-        返回：意图、情绪、实体、置信度
+        策略：优先使用LLM（若可用），否则回退到规则匹配
         """
-        # 意图识别
+        # 尝试LLM分析
+        if llm_service.enabled:
+            llm_result = await llm_service.analyze_intent(message, conversation_history)
+            if llm_result and llm_result.get("intent"):
+                # LLM结果与规则结果融合
+                rule_intent, rule_confidence = self._detect_intent(message, session)
+                rule_entities = self._extract_entities(message)
+
+                # 合并实体（规则提取的实体通常更准确）
+                merged_entities = {**(llm_result.get("entities") or {}), **rule_entities}
+
+                return {
+                    "intent": llm_result["intent"],
+                    "emotion": llm_result.get("emotion", self._detect_emotion(message)),
+                    "entities": merged_entities,
+                    "confidence": llm_result.get("confidence", 0.85),
+                    "source": "llm",
+                }
+
+        # 回退到规则匹配
         intent, intent_confidence = self._detect_intent(message, session)
-
-        # 情绪识别
         emotion = self._detect_emotion(message)
-
-        # 实体抽取
         entities = self._extract_entities(message)
-
-        # 综合置信度
-        confidence = intent_confidence
 
         return {
             "intent": intent,
             "emotion": emotion,
             "entities": entities,
-            "confidence": confidence,
+            "confidence": intent_confidence,
+            "source": "rules",
         }
 
     def _detect_intent(
@@ -71,7 +87,7 @@ class NLUService:
         message: str,
         session: Optional[CustomerSession] = None,
     ) -> tuple:
-        """意图识别"""
+        """意图识别（规则匹配）"""
         scores = {}
 
         for intent, keywords in INTENT_KEYWORDS.items():
@@ -83,16 +99,13 @@ class NLUService:
                 scores[intent] = score / len(keywords)
 
         if not scores:
-            # 如果没有匹配到任何意图，尝试使用上下文
             if session and session.current_intent:
                 return session.current_intent, 0.4
             return "unknown", 0.2
 
-        # 选择得分最高的意图
         best_intent = max(scores, key=scores.get)
-        confidence = min(scores[best_intent] * 2, 0.95)  # 归一化到0-0.95
+        confidence = min(scores[best_intent] * 2, 0.95)
 
-        # 多意图检测：如果有负面情绪关键词，附加情绪意图
         return best_intent, confidence
 
     def _detect_emotion(self, message: str) -> str:
@@ -107,11 +120,11 @@ class NLUService:
         """实体抽取"""
         entities = {}
 
-        # 订单号抽取（数字序列）
+        # 订单号抽取
         order_patterns = [
             r'订单[号]?\s*[:：]?\s*(\d{6,20})',
             r'单号\s*[:：]?\s*(\d{6,20})',
-            r'(?<!\d)(\d{10,20})(?!\d)',  # 10-20位纯数字
+            r'(?<!\d)(\d{10,20})(?!\d)',
         ]
         for pattern in order_patterns:
             match = re.search(pattern, message)
@@ -143,7 +156,7 @@ class NLUService:
                 entities["time_ref"] = match.group(0)
                 break
 
-        # 商品名抽取（简化版）
+        # 商品名抽取
         product_patterns = [
             r'买的(.{2,20}?)(?:怎么|还没|一直)',
             r'商品[名]?\s*[:：]?\s*(.{2,20})',
@@ -158,6 +171,19 @@ class NLUService:
 
     async def generate_clarification(self, message: str, intent: str) -> str:
         """当置信度不足时生成澄清问题"""
+        # 尝试LLM生成
+        if llm_service.enabled:
+            prompt = f"用户说：{message}\n当前猜测意图：{intent}\n请生成一个简短的澄清问题帮助确认用户需求。"
+            result = await llm_service.chat_completion(
+                [{"role": "system", "content": "你是智能客服，需要向用户提出澄清问题确认需求。回复简短自然。"},
+                 {"role": "user", "content": prompt}],
+                temperature=0.5,
+                max_tokens=150,
+            )
+            if result:
+                return result
+
+        # 回退到模板
         clarifications = {
             "unknown": "您好，请问您需要什么帮助？您可以选择以下服务：查询订单、查询物流、申请退款、申请退货，或者其他问题。",
             "order_status": "请问您是想查询订单状态吗？方便提供一下订单号吗？",

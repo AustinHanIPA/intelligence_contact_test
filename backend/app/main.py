@@ -27,8 +27,14 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     """应用启动时初始化数据库表"""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"数据库连接失败，请确保 PostgreSQL 已启动: {e}"
+        )
 
 
 @app.on_event("shutdown")
